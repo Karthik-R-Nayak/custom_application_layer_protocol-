@@ -4,7 +4,9 @@ Receives telemetry packets, sends ACK/NACK, logs received data.
 
 Usage:
     python server.py [--host 0.0.0.0] [--port 9000] [--loss-sim 0.0]
+
 """
+
 from threaded_server import ThreadedServerWrapper
 import socket
 import argparse
@@ -12,7 +14,6 @@ import logging
 import time
 import random
 import json
-from collections import defaultdict
 from protocol import (
     parse_packet, build_ack, build_nack,
     PKT_DATA, PKT_HELLO, PKT_BYE,
@@ -30,13 +31,13 @@ log = logging.getLogger(__name__)
 class TelemetrySession:
     """Tracks per-client session state."""
     def __init__(self, addr):
-        self.addr        = addr
+        self.addr         = addr
         self.expected_seq = 0
-        self.received    = 0        # total packets accepted
-        self.duplicates  = 0
+        self.received     = 0
+        self.duplicates   = 0
         self.out_of_order = 0
-        self.start_time  = time.time()
-        self.buffer      = {}       # seq → payload (reorder buffer)
+        self.start_time   = time.time()
+        self.buffer       = {}   # seq → payload (reorder buffer)
 
     def stats(self):
         elapsed = time.time() - self.start_time
@@ -50,26 +51,17 @@ class TelemetrySession:
 
 
 class ReliableUDPServer:
-    def _process_packet(self, raw, addr):
-    msg_id, pkt_type, flags, seq, payload = parse_packet(raw)
-
-    if pkt_type == PKT_HELLO:
-        self._handle_hello(addr, msg_id, seq)
-    elif pkt_type == PKT_DATA:
-        self._handle_data(addr, msg_id, seq, payload)
-    elif pkt_type == PKT_BYE:
-        self._handle_bye(addr, msg_id, seq)
-
-    
     def __init__(self, host: str, port: int, loss_sim: float = 0.0):
         self.host     = host
         self.port     = port
-        self.loss_sim = loss_sim          # artificial ACK drop rate for testing
+        self.loss_sim = loss_sim
         self.sessions: dict[tuple, TelemetrySession] = {}
         self.sock     = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.sock.bind((self.host, self.port))
         log.info(f"Listening on {host}:{port}  (ACK loss simulation={loss_sim*100:.0f}%)")
+
+    # ── Session helpers ──────────────────────────────────────────────────────
 
     def _get_session(self, addr) -> TelemetrySession:
         if addr not in self.sessions:
@@ -78,7 +70,6 @@ class ReliableUDPServer:
         return self.sessions[addr]
 
     def _send_ack(self, addr, msg_id: int, seq: int):
-        """Send ACK, optionally simulating loss for testing."""
         if self.loss_sim > 0 and random.random() < self.loss_sim:
             log.debug(f"[SIM] Dropping ACK seq={seq} to {addr}")
             return
@@ -91,6 +82,8 @@ class ReliableUDPServer:
         self.sock.sendto(pkt, addr)
         log.debug(f"NACK msg={msg_id} seq={seq} → {addr}")
 
+    # ── Packet handlers ──────────────────────────────────────────────────────
+
     def _handle_hello(self, addr, msg_id: int, seq: int):
         sess = self._get_session(addr)
         sess.expected_seq = 0
@@ -102,6 +95,10 @@ class ReliableUDPServer:
         log.info(f"BYE from {addr} — session stats: {json.dumps(sess.stats())}")
         self._send_ack(addr, msg_id, seq)
         del self.sessions[addr]
+        # thread and queue for this client so they don't leak.
+        wrapper = getattr(self, '_threaded_wrapper', None)
+        if wrapper is not None:
+            wrapper.cleanup_client(addr)
 
     def _handle_data(self, addr, msg_id: int, seq: int, payload: bytes):
         sess = self._get_session(addr)
@@ -133,7 +130,6 @@ class ReliableUDPServer:
         self._send_ack(addr, msg_id, seq)
 
     def _deliver(self, addr, seq: int, payload: bytes, sess: TelemetrySession):
-        """Process a correctly ordered payload."""
         sess.received += 1
         try:
             data = json.loads(payload.decode('utf-8'))
@@ -141,7 +137,33 @@ class ReliableUDPServer:
         except Exception:
             log.info(f"DATA seq={seq:04d} from {addr}: {payload.hex()}")
 
+    # ── Central dispatch (used by ThreadedServerWrapper) ────────────────────
+
+    def _process_packet(self, raw: bytes, addr):
+       
+        try:
+            msg_id, pkt_type, flags, seq, payload = parse_packet(raw)
+        except ValueError as e:
+            log.warning(f"Bad packet from {addr}: {e}")
+            return
+
+        if pkt_type == PKT_HELLO:
+            self._handle_hello(addr, msg_id, seq)
+        elif pkt_type == PKT_DATA:
+            self._handle_data(addr, msg_id, seq, payload)
+        elif pkt_type == PKT_BYE:
+            self._handle_bye(addr, msg_id, seq)
+        else:
+            log.warning(f"Unknown packet type {pkt_type:#04x} from {addr}")
+
+    # ── Standalone run loop ──────────────────────────────────────────────────
+
     def run(self):
+        """
+        Simple single-threaded receive loop.
+
+        
+        """
         log.info("Server ready — waiting for telemetry packets …")
         while True:
             try:
@@ -150,25 +172,12 @@ class ReliableUDPServer:
                 log.info("Shutting down.")
                 break
 
-            try:
-                msg_id, pkt_type, flags, seq, payload = parse_packet(raw)
-            except ValueError as e:
-                log.warning(f"Bad packet from {addr}: {e}")
-                continue
-
-            if pkt_type == PKT_HELLO:
-                self._handle_hello(addr, msg_id, seq)
-            elif pkt_type == PKT_DATA:
-                self._handle_data(addr, msg_id, seq, payload)
-            elif pkt_type == PKT_BYE:
-                self._handle_bye(addr, msg_id, seq)
-            else:
-                log.warning(f"Unknown packet type {pkt_type:#04x} from {addr}")
+            self._process_packet(raw, addr)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Reliable UDP Telemetry Server")
-    parser.add_argument('--host',     default='0.0.0.0',  help='Bind address')
+    parser.add_argument('--host',     default='0.0.0.0', help='Bind address')
     parser.add_argument('--port',     type=int, default=9000, help='UDP port')
     parser.add_argument('--loss-sim', type=float, default=0.0,
                         help='Fraction of ACKs to drop (0.0–1.0) for testing')
