@@ -4,6 +4,8 @@ Sends telemetry data with sequence numbers, ACK tracking, and retransmission.
 
 Usage:
     python client.py [--host 127.0.0.1] [--port 9000] [--count 20] [--interval 0.5]
+
+
 """
 
 import socket
@@ -34,28 +36,31 @@ log = logging.getLogger(__name__)
 @dataclass
 class PendingPacket:
     """A packet awaiting acknowledgment."""
-    msg_id:    int
-    seq:       int
-    raw:       bytes
-    send_time: float = field(default_factory=time.time)
-    retx_count: int  = 0
-    acked:     bool  = False
+    msg_id:     int
+    seq:        int
+    payload:    bytes          # original payload, kept for NACK retransmit rebuild
+    flags:      int            # original flags (without FLAG_RETX)
+    raw:        bytes          # wire bytes of the most-recently-sent version
+    send_time:  float = field(default_factory=time.time)
+    retx_count: int   = 0
+    acked:      bool  = False
 
 
 class ReliableUDPClient:
     def __init__(self, host: str, port: int,
                  timeout: float = DEFAULT_TIMEOUT,
                  max_retx: int  = MAX_RETRANSMITS):
-        self.server_addr  = (host, port)
-        self.timeout      = timeout
-        self.max_retx     = max_retx
-        self.msg_id       = 1          # session ID (increments each run)
-        self.seq          = 0          # per-session sequence number
+        self.server_addr = (host, port)
+        self.timeout     = timeout
+        self.max_retx    = max_retx
+        # FIX 2: msg_id starts at 0; connect() increments it to 1 (and again on
+        # every reconnect), so each session gets a unique ID.
+        self.msg_id      = 0
+        self.seq         = 0
         self.pending: dict[int, PendingPacket] = {}
-        self.lock         = threading.Lock()
-        self._stop_event  = threading.Event()
+        self.lock        = threading.Lock()
+        self._stop_event = threading.Event()
 
-        # Statistics
         self.stats = {
             'sent':        0,
             'acked':       0,
@@ -64,9 +69,9 @@ class ReliableUDPClient:
         }
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(0.1)   # non-blocking-ish for the ACK receiver
+        self.sock.settimeout(0.1)
 
-    # ── Internal helpers ────────────────────────────────────────────────────
+    # ── Internal helpers ─────────────────────────────────────────────────────
 
     def _next_seq(self) -> int:
         s = self.seq
@@ -76,14 +81,12 @@ class ReliableUDPClient:
     def _send_raw(self, raw: bytes):
         self.sock.sendto(raw, self.server_addr)
 
-    def _build_data_pkt(self, seq: int, payload: bytes,
-                        flags: int = 0) -> bytes:
+    def _build_data_pkt(self, seq: int, payload: bytes, flags: int = 0) -> bytes:
         return build_packet(self.msg_id, PKT_DATA, seq, payload, flags)
 
-    # ── ACK receiver (runs in background thread) ────────────────────────────
+    # ── ACK receiver ────────────────────────────────────────────────────────
 
     def _ack_receiver(self):
-        """Background thread: receives ACK/NACK and updates pending table."""
         while not self._stop_event.is_set():
             try:
                 raw, _ = self.sock.recvfrom(MAX_PACKET_SIZE + 16)
@@ -106,25 +109,26 @@ class ReliableUDPClient:
                         log.debug(f"ACK  seq={seq}")
 
             elif pkt_type == PKT_NACK:
-                # Server is requesting retransmission of `seq`
                 log.info(f"NACK received for seq={seq} — retransmitting")
                 with self.lock:
                     if seq in self.pending and not self.pending[seq].acked:
                         pkt = self.pending[seq]
-                        raw_retx = self._build_data_pkt(
-                            seq, b'',   # payload already embedded? no—rebuild
-                            FLAG_RETX
+                        # FIX 1: Build a fresh packet with FLAG_RETX set using
+                        # the stored payload.  The previous code built raw_retx
+                        # with b'' (empty payload) and then never used it —
+                        # both bugs are corrected here.
+                        retx_raw = self._build_data_pkt(
+                            seq, pkt.payload, pkt.flags | FLAG_RETX
                         )
-                        # Actually we store raw; rebuild with RETX flag
-                        self._send_raw(pkt.raw)
+                        pkt.raw        = retx_raw   # update stored raw too
                         pkt.retx_count += 1
                         pkt.send_time  = time.time()
                         self.stats['retransmits'] += 1
+                        self._send_raw(retx_raw)
 
-    # ── Timeout watchdog (runs in background thread) ────────────────────────
+    # ── Timeout watchdog ─────────────────────────────────────────────────────
 
     def _timeout_watchdog(self):
-        """Retransmits packets that have not been ACKed within timeout."""
         while not self._stop_event.is_set():
             time.sleep(0.05)
             now = time.time()
@@ -135,19 +139,23 @@ class ReliableUDPClient:
                     if now - pkt.send_time >= self.timeout:
                         if pkt.retx_count >= self.max_retx:
                             log.error(f"DROPPED seq={seq} after {self.max_retx} retransmits")
-                            pkt.acked = True    # mark done to stop retrying
+                            pkt.acked = True
                             self.stats['dropped'] += 1
                         else:
                             log.warning(
                                 f"TIMEOUT seq={seq} "
                                 f"(attempt {pkt.retx_count+1}/{self.max_retx})"
                             )
-                            self._send_raw(pkt.raw)
+                            retx_raw = self._build_data_pkt(
+                                seq, pkt.payload, pkt.flags | FLAG_RETX
+                            )
+                            pkt.raw        = retx_raw
                             pkt.retx_count += 1
                             pkt.send_time  = now
                             self.stats['retransmits'] += 1
+                            self._send_raw(retx_raw)
 
-    # ── Window management ───────────────────────────────────────────────────
+    # ── Window management ────────────────────────────────────────────────────
 
     def _window_full(self) -> bool:
         with self.lock:
@@ -158,14 +166,17 @@ class ReliableUDPClient:
         while self._window_full():
             time.sleep(0.01)
 
-    # ── Public API ──────────────────────────────────────────────────────────
+    # ── Public API ───────────────────────────────────────────────────────────
 
     def connect(self):
-        """Send HELLO to initiate session."""
+        """Send HELLO to initiate a new session."""
+        # FIX 2: Increment msg_id on every connect so sessions are distinguishable.
+        self.msg_id += 1
+        self.seq     = 0
         log.info(f"Connecting to {self.server_addr}  msg_id={self.msg_id}")
+
         hello = build_packet(self.msg_id, PKT_HELLO, 0)
         self._send_raw(hello)
-        # Wait briefly for HELLO ACK (best-effort)
         try:
             raw, _ = self.sock.recvfrom(MAX_PACKET_SIZE + 16)
             parse_packet(raw)
@@ -173,16 +184,15 @@ class ReliableUDPClient:
         except (socket.timeout, ValueError):
             log.warning("No HELLO ACK — proceeding anyway")
 
-        # Start background threads
         self._stop_event.clear()
-        self._ack_thread  = threading.Thread(target=self._ack_receiver,   daemon=True)
+        self._ack_thread  = threading.Thread(target=self._ack_receiver,    daemon=True)
         self._retx_thread = threading.Thread(target=self._timeout_watchdog, daemon=True)
         self._ack_thread.start()
         self._retx_thread.start()
 
     def send_telemetry(self, data: dict, last: bool = False) -> int:
         """
-        Serialise `data` to JSON, send as a DATA packet.
+        Serialise `data` to JSON and send as a DATA packet.
         Returns the sequence number assigned.
         Blocks if the send window is full.
         """
@@ -196,7 +206,12 @@ class ReliableUDPClient:
         seq   = self._next_seq()
         raw   = self._build_data_pkt(seq, payload, flags)
 
-        pkt   = PendingPacket(msg_id=self.msg_id, seq=seq, raw=raw)
+        # FIX 1: Store payload and flags separately so NACK/timeout retransmit
+        # can rebuild the packet with FLAG_RETX without corrupting the original.
+        pkt = PendingPacket(
+            msg_id=self.msg_id, seq=seq,
+            payload=payload, flags=flags, raw=raw
+        )
         with self.lock:
             self.pending[seq] = pkt
             self.stats['sent'] += 1
@@ -205,16 +220,31 @@ class ReliableUDPClient:
         log.info(f"SENT seq={seq:04d}  {data}")
         return seq
 
-    def flush(self, timeout: float = 10.0):
-        """Block until all pending packets are ACKed (or dropped)."""
+    def flush(self, timeout: float = 10.0) -> bool:
+        """
+        Block until all pending packets are ACKed or permanently dropped.
+
+        FIX 3: Returns True if every packet was ACKed, False if any were dropped,
+               so the caller can log or react accordingly.
+        """
         deadline = time.time() + timeout
         while time.time() < deadline:
             with self.lock:
                 unacked = sum(1 for p in self.pending.values() if not p.acked)
             if unacked == 0:
-                return
+                break
             time.sleep(0.05)
-        log.warning("flush() timed out with unacked packets remaining")
+        else:
+            log.warning("flush() timed out with unacked packets remaining")
+
+        with self.lock:
+            all_acked = all(p.acked for p in self.pending.values())
+            dropped   = self.stats['dropped']
+
+        if dropped:
+            log.warning(f"Session ended with {dropped} permanently dropped packet(s)")
+            return False
+        return True
 
     def disconnect(self):
         """Send BYE and tear down."""
@@ -238,7 +268,7 @@ class ReliableUDPClient:
         )
 
 
-# ── Telemetry generator (simulates IoT sensor readings) ─────────────────────
+# ── Telemetry generator ──────────────────────────────────────────────────────
 
 def generate_telemetry(index: int) -> dict:
     return {
@@ -274,7 +304,9 @@ def main():
             time.sleep(args.interval)
 
         log.info("All packets sent — waiting for ACKs …")
-        client.flush(timeout=15.0)
+        success = client.flush(timeout=15.0)
+        if not success:
+            log.error("Some packets were lost permanently.")
     finally:
         client.print_stats()
         client.disconnect()
