@@ -5,7 +5,7 @@ Receives telemetry packets, sends ACK/NACK, logs received data.
 Usage:
     python server.py [--host 0.0.0.0] [--port 9000] [--loss-sim 0.0]
 """
-
+from threaded_server import ThreadedServerWrapper
 import socket
 import argparse
 import logging
@@ -50,6 +50,17 @@ class TelemetrySession:
 
 
 class ReliableUDPServer:
+    def _process_packet(self, raw, addr):
+    msg_id, pkt_type, flags, seq, payload = parse_packet(raw)
+
+    if pkt_type == PKT_HELLO:
+        self._handle_hello(addr, msg_id, seq)
+    elif pkt_type == PKT_DATA:
+        self._handle_data(addr, msg_id, seq, payload)
+    elif pkt_type == PKT_BYE:
+        self._handle_bye(addr, msg_id, seq)
+
+    
     def __init__(self, host: str, port: int, loss_sim: float = 0.0):
         self.host     = host
         self.port     = port
@@ -164,7 +175,7 @@ def main():
     args = parser.parse_args()
 
     server = ReliableUDPServer(args.host, args.port, args.loss_sim)
-    server.run()
+    ThreadedServerWrapper(server).run()
 
 
 if __name__ == '__main__':
